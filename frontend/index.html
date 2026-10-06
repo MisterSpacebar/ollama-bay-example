@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ollama Data Chat</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+  table { border-collapse: collapse; font-size: 0.85rem; }
+  th, td { border: 1px solid #ccc; padding: 2px 8px; }
+  th { background: #f3f3f3; position: sticky; top: 0; }
+  #preview { max-height: 300px; overflow: auto; margin: 1rem 0; }
+  #answer { white-space: pre-wrap; background: #f8f8f8; padding: 1rem; min-height: 4rem; margin-top: 1rem; }
+  input[type=text] { width: 70%; }
+</style>
+</head>
+<body>
+<h1>Ollama Data Chat</h1>
+
+<h2>Load from server data</h2>
+<select id="localGroups"></select>
+<button id="loadLocal">Load</button>
+
+<h2>Or upload a file</h2>
+<input type="file" id="file" accept=".csv,.xlsx,.xlsm,.json">
+<button id="upload">Upload</button>
+<span id="status"></span>
+
+<div id="preview"></div>
+
+<form id="chat" hidden>
+  <input type="text" id="question" placeholder="Ask about your data..." required>
+  <button>Ask</button>
+</form>
+<div id="answer"></div>
+
+<script>
+let datasetId = null;
+const $ = (id) => document.getElementById(id);
+
+async function loadLocalGroups() {
+  const res = await fetch("/api/local-datasets");
+  if (!res.ok) return;
+  const { groups } = await res.json();
+  const select = $("localGroups");
+  select.innerHTML = "";
+  groups.forEach((g) => {
+    const opt = document.createElement("option");
+    opt.value = g.path;
+    opt.textContent = `${g.path} (${g.files.length} file${g.files.length === 1 ? "" : "s"})`;
+    select.appendChild(opt);
+  });
+}
+loadLocalGroups();
+
+$("loadLocal").onclick = async () => {
+  const path = $("localGroups").value;
+  if (!path) return;
+  $("status").textContent = "Loading...";
+  const res = await fetch("/api/local-datasets/load", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) {
+    $("status").textContent = (await res.json()).detail;
+    return;
+  }
+  const data = await res.json();
+  datasetId = data.dataset_id;
+  $("status").textContent = `${data.filename}: ${data.rows} rows`;
+  renderTable(data.columns.map((c) => c.name), data.preview);
+  $("chat").hidden = false;
+};
+
+$("upload").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  $("status").textContent = "Uploading...";
+  const body = new FormData();
+  body.append("file", f);
+  const res = await fetch("/api/upload", { method: "POST", body });
+  if (!res.ok) {
+    $("status").textContent = (await res.json()).detail;
+    return;
+  }
+  const data = await res.json();
+  datasetId = data.dataset_id;
+  $("status").textContent = `${data.filename}: ${data.rows} rows`;
+  renderTable(data.columns.map((c) => c.name), data.preview);
+  $("chat").hidden = false;
+};
+
+
+function renderTable(cols, rows) {
+  const table = document.createElement("table");
+  const head = table.insertRow();
+  cols.forEach((c) => { const th = document.createElement("th"); th.textContent = c; head.appendChild(th); });
+  rows.forEach((r) => {
+    const tr = table.insertRow();
+    cols.forEach((c) => { tr.insertCell().textContent = r[c] ?? ""; });
+  });
+  $("preview").replaceChildren(table);
+}
+
+$("chat").onsubmit = async (e) => {
+  e.preventDefault();
+  const out = $("answer");
+  out.textContent = "";
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dataset_id: datasetId, question: $("question").value }),
+  });
+  if (!res.ok) { out.textContent = (await res.json()).detail; return; }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop();
+    for (const ev of events) {
+      const payload = ev.replace(/^data: /, "");
+      if (payload === "[DONE]") return;
+      const msg = JSON.parse(payload);
+      if (msg.tool) out.textContent += `[tool] ${msg.tool}\n`;
+      else out.textContent += msg.token ?? `\n[error: ${msg.error}]`;
+    }
+  }
+};
+</script>
+</body>
+</html>
