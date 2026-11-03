@@ -4,3 +4,6 @@ python-multipart
 pandas
 openpyxl
 ollama
+streamlit
+requests
+matplotlib

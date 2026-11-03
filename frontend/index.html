@@ -11,6 +11,7 @@
   #preview { max-height: 300px; overflow: auto; margin: 1rem 0; }
   #answer { white-space: pre-wrap; background: #f8f8f8; padding: 1rem; min-height: 4rem; margin-top: 1rem; }
   input[type=text] { width: 70%; }
+  .muted { color: #666; font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -18,14 +19,23 @@
 
 <h2>Load from server data</h2>
 <select id="localGroups"></select>
-<button id="loadLocal">Load</button>
+<button id="loadLocal">Load selected</button>
+<button id="loadAll">Load ALL (ask about everything)</button>
+<p class="muted">"Load ALL" loads every folder under water_data/ at once so you can ask
+broad questions spanning the whole corpus; tools reference datasets by name.</p>
 
 <h2>Or upload a file</h2>
 <input type="file" id="file" accept=".csv,.xlsx,.xlsm,.json">
 <button id="upload">Upload</button>
 <span id="status"></span>
 
+<div>
+  <label><input type="checkbox" id="clean"> Quarantine out-of-range sensor values</label>
+</div>
+
 <div id="preview"></div>
+<div id="cleaningReport"></div>
+<div id="fcmSummary"></div>
 
 <form id="chat" hidden>
   <input type="text" id="question" placeholder="Ask about your data..." required>
@@ -35,6 +45,7 @@
 
 <script>
 let datasetId = null;
+let datasetGroupId = null;
 const $ = (id) => document.getElementById(id);
 
 async function loadLocalGroups() {
@@ -52,6 +63,16 @@ async function loadLocalGroups() {
 }
 loadLocalGroups();
 
+function activateSingleDataset(data) {
+  datasetId = data.dataset_id;
+  datasetGroupId = null;
+  $("status").textContent = `${data.filename}: ${data.rows} rows`;
+  renderTable(data.columns.map((c) => c.name), data.preview);
+  renderCleaningReport(data.cleaning_report);
+  renderFcmSummary(data.fcm_summary);
+  $("chat").hidden = false;
+}
+
 $("loadLocal").onclick = async () => {
   const path = $("localGroups").value;
   if (!path) return;
@@ -59,16 +80,35 @@ $("loadLocal").onclick = async () => {
   const res = await fetch("/api/local-datasets/load", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, clean: $("clean").checked }),
+  });
+  if (!res.ok) {
+    $("status").textContent = (await res.json()).detail;
+    return;
+  }
+  activateSingleDataset(await res.json());
+};
+
+$("loadAll").onclick = async () => {
+  $("status").textContent = "Loading all datasets...";
+  const res = await fetch("/api/local-datasets/load-all", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clean: $("clean").checked }),
   });
   if (!res.ok) {
     $("status").textContent = (await res.json()).detail;
     return;
   }
   const data = await res.json();
-  datasetId = data.dataset_id;
-  $("status").textContent = `${data.filename}: ${data.rows} rows`;
-  renderTable(data.columns.map((c) => c.name), data.preview);
+  datasetGroupId = data.dataset_group_id;
+  datasetId = null;
+  $("status").textContent = `Loaded ${data.datasets.length} datasets`;
+  $("preview").innerHTML = data.datasets
+    .map((d) => `<div><strong>${d.name}</strong> — ${d.rows} rows — ${d.columns.join(", ")}</div>`)
+    .join("");
+  $("cleaningReport").textContent = "";
+  $("fcmSummary").textContent = "";
   $("chat").hidden = false;
 };
 
@@ -78,18 +118,30 @@ $("upload").onclick = async () => {
   $("status").textContent = "Uploading...";
   const body = new FormData();
   body.append("file", f);
+  body.append("clean", $("clean").checked);
   const res = await fetch("/api/upload", { method: "POST", body });
   if (!res.ok) {
     $("status").textContent = (await res.json()).detail;
     return;
   }
-  const data = await res.json();
-  datasetId = data.dataset_id;
-  $("status").textContent = `${data.filename}: ${data.rows} rows`;
-  renderTable(data.columns.map((c) => c.name), data.preview);
-  $("chat").hidden = false;
+  activateSingleDataset(await res.json());
 };
 
+function renderCleaningReport(report) {
+  const div = $("cleaningReport");
+  if (!report || !report.length) { div.textContent = ""; return; }
+  const lines = report.map((r) => `${r.column}: quarantined ${r.quarantined} (bounds ${r.bounds[0]}–${r.bounds[1]})`);
+  div.innerHTML = `<strong>Cleaning report</strong><pre>${lines.join("\n")}</pre>`;
+}
+
+function renderFcmSummary(summary) {
+  const div = $("fcmSummary");
+  if (!summary || !summary.top_causal_edges || !summary.top_causal_edges.length) { div.textContent = ""; return; }
+  const lines = summary.top_causal_edges
+    .slice(0, 8)
+    .map((e) => `${e.from} ${e.weight > 0 ? "promotes" : "suppresses"} ${e.to} (${e.weight > 0 ? "+" : ""}${e.weight})`);
+  div.innerHTML = `<strong>Precomputed causal relationships (FCM)</strong><pre>${lines.join("\n")}</pre>`;
+}
 
 function renderTable(cols, rows) {
   const table = document.createElement("table");
@@ -109,7 +161,11 @@ $("chat").onsubmit = async (e) => {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dataset_id: datasetId, question: $("question").value }),
+    body: JSON.stringify({
+      dataset_id: datasetId,
+      dataset_group_id: datasetGroupId,
+      question: $("question").value,
+    }),
   });
   if (!res.ok) { out.textContent = (await res.json()).detail; return; }
 

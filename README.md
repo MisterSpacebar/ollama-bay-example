@@ -5,7 +5,7 @@ FastAPI backend that loads CSV/Excel/JSON files and lets you ask questions about
 ## Setup
 
 ```powershell
-ollama pull granite4.1:3b
+ollama pull granite4.1:8b
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -16,7 +16,9 @@ Open http://localhost:8000.
 
 ## Config (env vars)
 
-- `OLLAMA_MODEL` (default `granite4.1:3b`)
+- `OLLAMA_MODEL` (default `granite4.1:8b`; the smaller `granite4.1:3b` also works and uses less
+  memory/VRAM, but struggles with multi-hop/multi-dataset reasoning -- use `granite4.1:3b` only
+  if resources are constrained)
 - `OLLAMA_HOST` (default `http://localhost:11434`)
 
 ## API
