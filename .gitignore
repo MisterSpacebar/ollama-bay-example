@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 water_data/
+
+# Local research verification outputs (never commit private source-specific results)
+validation_report*.json
+trustworthy_outputs/
