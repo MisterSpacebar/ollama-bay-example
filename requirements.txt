@@ -2,10 +2,9 @@ fastapi
 uvicorn[standard]
 python-multipart
 pandas
+numpy
 openpyxl
 ollama
 streamlit
 requests
 matplotlib
-
-httpx>=0.27
