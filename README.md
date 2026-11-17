@@ -145,3 +145,30 @@ python -m py_compile backend/*.py streamlit_app.py
 The suite uses synthetic CSVs and mocks Ollama; it does not claim to validate
 scientific performance against your private source data, nor to exercise a
 real browser/Streamlit session.
+
+
+## Development and test environments
+
+Install the application dependencies and HTTP test client through the separate
+[test requirements](requirements-test.txt):
+
+```powershell
+python -m pip install -r requirements-test.txt
+python -m unittest discover -s tests -v
+python -m py_compile backend/*.py streamlit_app.py
+```
+
+The application itself only needs `requirements.txt`; `httpx` is used by
+FastAPI/Starlette's `TestClient` in the integration tests. The direct runtime
+`numpy` dependency is declared explicitly. CI runs the test dependency set
+on Python 3.11, while development may use newer interpreters.
+
+On Windows without symlink privileges, the test that creates a **real**
+symlink is skipped (Developer Mode or elevated privileges enable it). A
+separate mocked-resolution regression test always exercises the path-escape
+rejection code without requiring symlink creation. A mocked check does not
+replace the Linux CI real-symlink test.
+
+Some newer Starlette/HTTP-client combinations may show deprecation notices.
+Treat those as dependency-compatibility warnings to investigate before any
+library migration, not as a reason to bypass the integration tests.
