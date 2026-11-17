@@ -8,7 +8,8 @@ import inspect
 import numpy as np
 import pandas as pd
 
-from backend.fcm import fcm as _fcm
+from backend.fcm_safe import safe_fcm as _fcm
+from backend.trustworthy_bay import hypoxia_audit
 
 
 def _numeric_column(df: pd.DataFrame, column: str) -> pd.Series:
@@ -188,6 +189,7 @@ OPERATIONS = {
     "group_summary": group_summary,
     "train_predict": train_predict,
     "fcm": _fcm,
+    "hypoxia_audit": hypoxia_audit,
 }
 
 
