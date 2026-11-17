@@ -111,7 +111,10 @@ class ResearchAdapterTests(unittest.TestCase):
         self.make_warnings()
         with tempfile.TemporaryDirectory() as outside:
             bad = self.root / 'environmental_gam'
-            bad.symlink_to(Path(outside), target_is_directory=True)
+            try:
+                bad.symlink_to(Path(outside), target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f'symlinks unavailable: {exc}')
             self.assertNotIn('gam_scores', [x['artifact'] for x in research_catalog(self.root)['available']])
             write(Path(outside), 'paired_scores.csv', [{
                 'outcome': 'o', 'threshold_mgL': 2,
