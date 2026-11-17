@@ -142,12 +142,14 @@ def render_research_panel(api_base: str) -> None:
             answer = ""
             tools = []
             error = None
+            status_box = st.empty()
             try:
                 with requests.post(
                     f"{api_base}/api/chat",
                     json={"research_only": True, "question": question.strip()},
                     stream=True,
-                    timeout=120,
+                    # The backend sends a keep-alive every few seconds, so a long silence means a stall.
+                    timeout=(10, 120),
                 ) as resp:
                     resp.raise_for_status()
                     for line in resp.iter_lines(decode_unicode=True):
@@ -157,6 +159,8 @@ def render_research_panel(api_base: str) -> None:
                         if payload == "[DONE]":
                             break
                         event = json.loads(payload)
+                        if "status" in event:
+                            status_box.caption(f"⏳ {event['status']}…")
                         if "token" in event:
                             answer += str(event["token"])
                         if "tool" in event:
@@ -165,6 +169,7 @@ def render_research_panel(api_base: str) -> None:
                             error = str(event["error"])
             except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
                 error = str(exc)
+            status_box.empty()
             st.session_state.research_chat_result = {
                 "question": question.strip(), "answer": answer,
                 "tools": tools, "error": error,

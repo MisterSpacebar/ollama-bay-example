@@ -159,6 +159,8 @@ def load_group_dataframe(target: Path) -> pd.DataFrame:
 # --- pandas tool-calling: lets the model run real code for exact answers ---
 TOOL_TIMEOUT_SECONDS = 5
 MAX_TOOL_ROUNDS = 6
+# Seconds of silence before /api/chat sends an SSE keep-alive comment while the model is busy.
+CHAT_HEARTBEAT_SECONDS = float(os.getenv("CHAT_HEARTBEAT_SECONDS", "10"))
 _pandas_executor = ThreadPoolExecutor(max_workers=2)
 # Best-effort denylist; exec() with a small builtins allowlist is the real boundary but
 # isn't a watertight sandbox, so this only runs against the user's own local data/model.
@@ -1190,120 +1192,159 @@ async def chat(req: ChatRequest):
     ]
 
     stream_events: list[dict] = []
-    response = None
-    any_tool_succeeded = False
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = await client.chat(
-            model=MODEL,
-            messages=messages,
-            tools=([RESEARCH_TOOL] if req.research_only else [PANDAS_TOOL, MODEL_TOOL, CHART_TOOL, MAP_TOOL] + ([RESEARCH_TOOL] if research_catalog()["enabled"] else [])),
-            options=OLLAMA_CHAT_OPTIONS,
-        )
-        tool_calls = response.message.tool_calls
-        if not tool_calls:
-            break
-        messages.append({"role": "assistant", "content": response.message.content or "", "tool_calls": tool_calls})
-        for call in tool_calls:
-            name = call.function.name
-            if name == "query_research_output":
-                output, display = execute_research_tool(dict(call.function.arguments))
-            elif name == "run_data_model":
-                output, display = await run_model_tool(dfs, dict(call.function.arguments))
-            elif name == "make_chart":
-                output, display = await run_chart_tool(dfs, dict(call.function.arguments))
-            elif name == "make_map":
-                output, display = await run_map_tool(dfs, dict(call.function.arguments))
-            else:
-                code = call.function.arguments.get("code", "")
-                output, display = await run_pandas_tool(dfs, code)
-            if not output.startswith("Error"):
-                any_tool_succeeded = True
-            stream_events.append({"tool": f"ran {name} -> {output[:200]}"})
-            if display is not None:
-                if "image_base64" in display:
-                    stream_events.append({"chart": display})
-                elif "lat_col" in display:
-                    stream_events.append({"map": display})
-                elif "chart_type" in display:
-                    stream_events.append({"chart_native": display})
+
+    async def pipeline(emit) -> str:
+        """Run the tool loop, emitting status/tool events as they happen; return the final text."""
+        response = None
+        any_tool_succeeded = False
+        for round_no in range(1, MAX_TOOL_ROUNDS + 1):
+            await emit({"status": f"Asking the model (round {round_no} of up to {MAX_TOOL_ROUNDS})"})
+            response = await client.chat(
+                model=MODEL,
+                messages=messages,
+                tools=([RESEARCH_TOOL] if req.research_only else [PANDAS_TOOL, MODEL_TOOL, CHART_TOOL, MAP_TOOL] + ([RESEARCH_TOOL] if research_catalog()["enabled"] else [])),
+                options=OLLAMA_CHAT_OPTIONS,
+            )
+            tool_calls = response.message.tool_calls
+            if not tool_calls:
+                break
+            messages.append({"role": "assistant", "content": response.message.content or "", "tool_calls": tool_calls})
+            for call in tool_calls:
+                name = call.function.name
+                await emit({"status": f"Running {name}"})
+                if name == "query_research_output":
+                    output, display = execute_research_tool(dict(call.function.arguments))
+                elif name == "run_data_model":
+                    output, display = await run_model_tool(dfs, dict(call.function.arguments))
+                elif name == "make_chart":
+                    output, display = await run_chart_tool(dfs, dict(call.function.arguments))
+                elif name == "make_map":
+                    output, display = await run_map_tool(dfs, dict(call.function.arguments))
                 else:
-                    stream_events.append({"table": display})
-            messages.append({"role": "tool", "tool_name": name, "content": output})
-    else:
-        # Exhausted rounds while the model kept calling tools; strip the tools param so it
-        # MUST answer in plain text this round, and explicitly tell it to stop exploring and
-        # synthesize from whatever's already in the conversation instead of continuing to dig.
-        if any_tool_succeeded:
-            wrap_up_instruction = (
-                "You've used up your tool-call budget. Don't call any more tools -- "
-                "answer the original question now, in plain language, using whatever "
-                "results you already got back above (there's likely at least one useful "
-                "number in there, e.g. a trend/forecast result)."
-            )
+                    code = call.function.arguments.get("code", "")
+                    output, display = await run_pandas_tool(dfs, code)
+                if not output.startswith("Error"):
+                    any_tool_succeeded = True
+                events = [{"tool": f"ran {name} -> {output[:200]}"}]
+                if display is not None:
+                    if "image_base64" in display:
+                        events.append({"chart": display})
+                    elif "lat_col" in display:
+                        events.append({"map": display})
+                    elif "chart_type" in display:
+                        events.append({"chart_native": display})
+                    else:
+                        events.append({"table": display})
+                for event in events:
+                    stream_events.append(event)
+                    await emit(event)
+                messages.append({"role": "tool", "tool_name": name, "content": output})
         else:
-            wrap_up_instruction = (
-                "You've used up your tool-call budget and EVERY tool call above resulted in "
-                "an error -- none of them produced any real data or numbers. This means you "
-                "have NO grounded result to report. Do NOT invent, estimate, or make up any "
-                "specific numbers, correlations, or statistics as if they came from the data "
-                "-- that would be fabrication. Instead, tell the user plainly that the "
-                "analysis couldn't be completed (briefly mention why, e.g. the code kept "
-                "getting blocked), and suggest a more specific/narrower way to ask so it's "
-                "more likely to succeed next time. You may still share general domain "
-                "reasoning (e.g. how rainfall generally affects dissolved oxygen) as long as "
-                "you're clear that's general knowledge, not something this data confirmed."
+            # Exhausted rounds while the model kept calling tools; strip the tools param so it
+            # MUST answer in plain text this round, and explicitly tell it to stop exploring and
+            # synthesize from whatever's already in the conversation instead of continuing to dig.
+            if any_tool_succeeded:
+                wrap_up_instruction = (
+                    "You've used up your tool-call budget. Don't call any more tools -- "
+                    "answer the original question now, in plain language, using whatever "
+                    "results you already got back above (there's likely at least one useful "
+                    "number in there, e.g. a trend/forecast result)."
+                )
+            else:
+                wrap_up_instruction = (
+                    "You've used up your tool-call budget and EVERY tool call above resulted in "
+                    "an error -- none of them produced any real data or numbers. This means you "
+                    "have NO grounded result to report. Do NOT invent, estimate, or make up any "
+                    "specific numbers, correlations, or statistics as if they came from the data "
+                    "-- that would be fabrication. Instead, tell the user plainly that the "
+                    "analysis couldn't be completed (briefly mention why, e.g. the code kept "
+                    "getting blocked), and suggest a more specific/narrower way to ask so it's "
+                    "more likely to succeed next time. You may still share general domain "
+                    "reasoning (e.g. how rainfall generally affects dissolved oxygen) as long as "
+                    "you're clear that's general knowledge, not something this data confirmed."
+                )
+            messages.append({"role": "user", "content": wrap_up_instruction})
+            await emit({"status": "Writing the final answer"})
+            response = await client.chat(model=MODEL, messages=messages, options=OLLAMA_CHAT_OPTIONS)
+
+        final_text = response.message.content or ""
+
+        any_tool_attempted = any("tool" in e for e in stream_events)
+        if any_tool_attempted and not any_tool_succeeded:
+            # Every tool call failed (no grounded result ever came back) -- regardless of how we
+            # got here (voluntary stop or exhausted budget), the model's free-form answer at this
+            # point is suspect: double-check it isn't presenting fabricated numbers as real
+            # findings, by forcing one more explicit, instructed rewrite rather than trusting it.
+            messages.append({"role": "assistant", "content": final_text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Wait -- every single tool call you made above ended in an error, so "
+                        "there is NO real data or computed number backing up your last answer. "
+                        "Rewrite your answer: do not state any specific number, correlation, "
+                        "percentage, or statistic as something the data showed, since none of "
+                        "that was actually computed. Say plainly that the analysis couldn't be "
+                        "completed and briefly why, then (optionally) share general domain "
+                        "reasoning clearly labeled as such, not as a data-backed finding."
+                    ),
+                }
             )
-        messages.append({"role": "user", "content": wrap_up_instruction})
-        response = await client.chat(model=MODEL, messages=messages, options=OLLAMA_CHAT_OPTIONS)
+            await emit({"status": "Checking the answer against failed tool calls"})
+            response = await client.chat(model=MODEL, messages=messages, options=OLLAMA_CHAT_OPTIONS)
+            final_text = response.message.content or final_text
 
-    final_text = response.message.content or ""
-
-    any_tool_attempted = any("tool" in e for e in stream_events)
-    if any_tool_attempted and not any_tool_succeeded:
-        # Every tool call failed (no grounded result ever came back) -- regardless of how we
-        # got here (voluntary stop or exhausted budget), the model's free-form answer at this
-        # point is suspect: double-check it isn't presenting fabricated numbers as real
-        # findings, by forcing one more explicit, instructed rewrite rather than trusting it.
-        messages.append({"role": "assistant", "content": final_text})
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Wait -- every single tool call you made above ended in an error, so "
-                    "there is NO real data or computed number backing up your last answer. "
-                    "Rewrite your answer: do not state any specific number, correlation, "
-                    "percentage, or statistic as something the data showed, since none of "
-                    "that was actually computed. Say plainly that the analysis couldn't be "
-                    "completed and briefly why, then (optionally) share general domain "
-                    "reasoning clearly labeled as such, not as a data-backed finding."
-                ),
-            }
-        )
-        response = await client.chat(model=MODEL, messages=messages, options=OLLAMA_CHAT_OPTIONS)
-        final_text = response.message.content or final_text
-
-    if not final_text.strip():
-        # Some small models can return a genuinely empty completion here (rare, but seen in
-        # practice) -- don't silently hand the user nothing after real tool work happened.
-        final_text = (
-            "I wasn't able to put together a clear final answer from the tool results above "
-            "(the model returned an empty response) -- the tool calls and any numbers found "
-            "are shown above though, so take a look at those, or try asking again, maybe "
-            "phrased a bit more narrowly."
-            if stream_events
-            else "I wasn't able to generate a response -- please try asking again."
-        )
+        if not final_text.strip():
+            # Some small models can return a genuinely empty completion here (rare, but seen in
+            # practice) -- don't silently hand the user nothing after real tool work happened.
+            final_text = (
+                "I wasn't able to put together a clear final answer from the tool results above "
+                "(the model returned an empty response) -- the tool calls and any numbers found "
+                "are shown above though, so take a look at those, or try asking again, maybe "
+                "phrased a bit more narrowly."
+                if stream_events
+                else "I wasn't able to generate a response -- please try asking again."
+            )
+        return final_text
 
     async def stream():
+        # Events are streamed as the pipeline produces them, with a keep-alive comment while
+        # the model is busy, so the client never waits silently past its read timeout. If the
+        # client disconnects, the pipeline task is cancelled, which aborts the Ollama request
+        # instead of leaving it to occupy Ollama's single slot.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def emit(event: dict) -> None:
+            await queue.put(event)
+
+        async def runner() -> str:
+            try:
+                return await pipeline(emit)
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(runner())
         try:
-            for event in stream_events:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=CHAT_HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if event is None:
+                    break
                 yield f"data: {json.dumps(event)}\n\n"
-            # Full text is already generated; chunk it to keep the streaming UX.
-            for i in range(0, len(final_text), 40):
-                yield f"data: {json.dumps({'token': final_text[i:i + 40]})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        yield "data: [DONE]\n\n"
+            try:
+                final_text = await task
+                # Full text is already generated; chunk it to keep the streaming UX.
+                for i in range(0, len(final_text), 40):
+                    yield f"data: {json.dumps({'token': final_text[i:i + 40]})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            if not task.done():
+                task.cancel()
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

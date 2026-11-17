@@ -179,9 +179,11 @@ $("chat").onsubmit = async (e) => {
     const events = buffer.split("\n\n");
     buffer = events.pop();
     for (const ev of events) {
+      if (ev.startsWith(":")) continue; // SSE keep-alive comment
       const payload = ev.replace(/^data: /, "");
       if (payload === "[DONE]") return;
       const msg = JSON.parse(payload);
+      if (msg.status) continue; // progress note only
       if (msg.tool) out.textContent += `[tool] ${msg.tool}\n`;
       else out.textContent += msg.token ?? `\n[error: ${msg.error}]`;
     }

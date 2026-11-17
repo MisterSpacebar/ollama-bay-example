@@ -205,6 +205,7 @@ def ask_question(question: str):
         tool_placeholder = st.empty()
         answer = ""
         answer_placeholder = st.empty()
+        status_placeholder = st.empty()
         try:
             with requests.post(
                 f"{API_BASE}/api/chat",
@@ -214,7 +215,8 @@ def ask_question(question: str):
                     "question": question,
                 },
                 stream=True,
-                timeout=120,
+                # The backend sends a keep-alive every few seconds, so a long silence means a stall.
+                timeout=(10, 120),
             ) as res:
                 for line in res.iter_lines(decode_unicode=True):
                     if not line or not line.startswith("data: "):
@@ -223,7 +225,9 @@ def ask_question(question: str):
                     if payload == "[DONE]":
                         break
                     msg = json.loads(payload)
-                    if "tool" in msg:
+                    if "status" in msg:
+                        status_placeholder.caption(f"⏳ {msg['status']}…")
+                    elif "tool" in msg:
                         tool_lines.append(msg["tool"])
                         with tool_placeholder.container():
                             render_tool_lines(tool_lines)
@@ -244,6 +248,7 @@ def ask_question(question: str):
         except Exception as e:
             answer = f"Request failed: {e}"
             answer_placeholder.markdown(answer)
+        status_placeholder.empty()
 
     st.session_state.history.append(
         {"role": "assistant", "content": answer, "tool_lines": tool_lines, "display_events": display_events}

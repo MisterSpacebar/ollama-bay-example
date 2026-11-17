@@ -95,6 +95,64 @@ class APIIntegrationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertIn('retrospective', resp.text)
 
+    def _fake_response(self, text='Answer text.'):
+        class Msg:
+            tool_calls = []
+            content = text
+        class Response:
+            message = Msg()
+        return Response()
+
+    def test_chat_streams_status_and_keepalives_while_the_model_is_busy(self):
+        import asyncio
+
+        async def slow_chat(*args, **kwargs):
+            await asyncio.sleep(0.4)
+            return self._fake_response('Slow but answered.')
+        with patch.object(main.client, 'chat', side_effect=slow_chat), \
+                patch.object(main, 'CHAT_HEARTBEAT_SECONDS', 0.05):
+            resp = self.client.post('/api/chat', json={'research_only': True, 'question': 'q'})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        text = resp.text
+        # Progress and keep-alives arrive before the answer, so clients never sit silent.
+        self.assertIn('"status": "Asking the model', text)
+        self.assertIn(': keep-alive', text)
+        self.assertLess(text.index(': keep-alive'), text.index('"token"'))
+        self.assertIn('Slow but answered.', text)
+        self.assertTrue(text.rstrip().endswith('data: [DONE]'))
+
+    def test_chat_pipeline_error_is_reported_as_an_event_not_a_dropped_stream(self):
+        async def failing_chat(*args, **kwargs):
+            raise RuntimeError('ollama unreachable')
+        with patch.object(main.client, 'chat', side_effect=failing_chat):
+            resp = self.client.post('/api/chat', json={'research_only': True, 'question': 'q'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('"error": "ollama unreachable"', resp.text)
+        self.assertTrue(resp.text.rstrip().endswith('data: [DONE]'))
+
+    def test_client_disconnect_cancels_the_in_flight_model_request(self):
+        import asyncio
+
+        async def scenario():
+            started, cancelled = asyncio.Event(), asyncio.Event()
+
+            async def hanging_chat(*args, **kwargs):
+                started.set()
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            with patch.object(main.client, 'chat', side_effect=hanging_chat), \
+                    patch.object(main, 'CHAT_HEARTBEAT_SECONDS', 0.05):
+                response = await main.chat(main.ChatRequest(research_only=True, question='q'))
+                stream = response.body_iterator
+                await stream.__anext__()  # first status event
+                await asyncio.wait_for(started.wait(), 2)
+                await stream.aclose()  # what the server does when the client goes away
+                await asyncio.wait_for(cancelled.wait(), 2)
+        asyncio.run(scenario())
+
 
 if __name__ == '__main__':
     unittest.main()
