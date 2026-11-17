@@ -32,7 +32,7 @@ ARTIFACTS = {
     ),
     "episode_runs": (
         "episode_dynamics/episode_table.csv",
-        ("node", "threshold_mgL", "start_date_local", "end_date_local",
+        ("node", "threshold_mgL", "start_date_local", "last_hypoxic_date_local",
          "censored_left", "censored_right", "provenance"),
         "Observed contiguous eligible low-oxygen calendar days, not continuous hypoxia hours.",
     ),
