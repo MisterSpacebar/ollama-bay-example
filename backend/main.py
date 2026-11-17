@@ -19,7 +19,8 @@ from pydantic import BaseModel
 from backend.processing import clean_dataframe
 from backend.modeling import run_data_model
 from backend.charts import make_chart, prepare_native_chart_data
-from backend.fcm import fcm as fit_fcm
+from backend.fcm_safe import safe_fcm as fit_fcm
+from backend.trustworthy_bay import hypoxia_audit
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "granite4.1:8b")
@@ -69,17 +70,17 @@ def compute_fcm_summary(df: pd.DataFrame) -> dict | None:
         result = fit_fcm(df, columns=numeric_cols)
     except Exception:
         return None
-    return {"concepts": result["concepts"], "top_causal_edges": result["top_causal_edges"]}
+    return {"concepts": result["concepts"], "top_causal_edges": result["top_causal_edges"], "interpretation": result["interpretation"]}
 
 
 def fcm_summary_to_text(summary: dict | None) -> str:
     if not summary or not summary["top_causal_edges"]:
         return ""
     lines = [
-        f"- {e['from']} {'promotes' if e['weight'] > 0 else 'suppresses'} {e['to']} (weight {e['weight']:+.2f})"
+        f"- {e['from']} -> {e['to']} (lagged association {e['weight']:+.2f})"
         for e in summary["top_causal_edges"][:8]
     ]
-    return "Precomputed causal relationships (FCM, fit once at load time):\n" + "\n".join(lines)
+    return "Exploratory, noncausal lagged associations (single station, regular time axis):\n" + "\n".join(lines)
 
 
 CSV_ENCODINGS = ("utf-8", "cp1252", "latin-1")
@@ -393,12 +394,16 @@ MODEL_TOOL = {
             "'train_predict' (fit a linear regression of `target` on `features`, report "
             "fit quality, and optionally predict for `new_rows` -- a list of "
             "{feature_name: value} objects), "
-            "'fcm' (Fuzzy Cognitive Map: learns a directed, weighted causal graph between "
+            "'fcm' (Fuzzy Cognitive Map: fits a directed, weighted lagged-association graph between "
             "`columns`, e.g. temperature/salinity/dissolved-oxygen, so you can discuss what "
             "drives what in `top_causal_edges`. Pass `forcing` for exogenous drivers like "
             "rainfall that only have outgoing edges. Pass `clamp` -- a {column: value} dict "
             "of scenario values -- to additionally simulate `steps_ahead` steps forward and "
-            "see the resulting `final_values` for a what-if discussion)."
+            "see the resulting `final_values` for an exploratory what-if discussion; "
+            "this is NOT a causal estimate or validated forecast). "
+            "'hypoxia_audit' (coverage-qualified, observed-only DO episodes at 2 and "
+            "4 mg/L; specify timestamp_col and do_col in mg/L, and optionally "
+            "station_col, observed_col, interval_minutes, min_coverage, timezone, station)."
         ),
         "parameters": {
             "type": "object",
@@ -407,7 +412,7 @@ MODEL_TOOL = {
                     "type": "string",
                     "enum": [
                         "impute", "trend_forecast", "anomalies", "correlation",
-                        "group_summary", "train_predict", "fcm",
+                        "group_summary", "train_predict", "fcm", "hypoxia_audit",
                     ],
                 },
                 "column": {"type": "string", "description": "Target numeric column."},
@@ -439,6 +444,14 @@ MODEL_TOOL = {
                     "items": {"type": "object"},
                     "description": "List of {feature_name: value} objects to predict (train_predict only).",
                 },
+                "timestamp_col": {"type": "string", "description": "Time column for fcm/hypoxia_audit."},
+                "do_col": {"type": "string", "description": "Dissolved oxygen concentration column in mg/L (hypoxia_audit)."},
+                "station_col": {"type": "string", "description": "Station/source identity column (fcm/hypoxia_audit)."},
+                "observed_col": {"type": "string", "description": "Boolean observation provenance column (hypoxia_audit)."},
+                "interval_minutes": {"type": "integer", "description": "Sampling interval in minutes (hypoxia_audit)."},
+                "min_coverage": {"type": "number", "description": "Required valid coverage per day, default 0.95."},
+                "timezone": {"type": "string", "description": "Timezone for local daily labels (hypoxia_audit)."},
+                "station": {"type": "string", "description": "Optional station to inspect (hypoxia_audit)."},
                 "dataset": {
                     "type": "string",
                     "description": "Which dataset name to use, only needed when multiple datasets are loaded.",
@@ -514,7 +527,7 @@ def _execute_data_model(dfs: dict[str, pd.DataFrame], kwargs: dict) -> tuple[str
         result = run_data_model(df, operation, **kwargs)
     except Exception as e:
         return (f"Error running model: {e}", None)
-    text = json.dumps(result)[:2000]
+    text = json.dumps(result)[:6000]
     display = _tabular_from_model_result(result) if isinstance(result, dict) else None
     return (text, display)
 
@@ -1035,7 +1048,7 @@ async def chat(req: ChatRequest):
                 "group summaries, a simple prediction model (train_predict), and a Fuzzy "
                 "Cognitive Map (fcm) that learns a causal graph and can simulate what-if "
                 "scenarios. Each dataset below already comes with a precomputed 'causal "
-                "relationships (FCM)' section from when the data was loaded, so for "
+                "associations (FCM) from regularly sampled single stations, so for "
                 "'what drives X'-type questions it's usually quickest to just read that "
                 "instead of re-running the fcm tool -- save the live fcm call for a "
                 "specific what-if/clamp scenario that summary doesn't already cover. "
@@ -1097,6 +1110,15 @@ async def chat(req: ChatRequest):
                 "qualitatively from general domain knowledge instead (e.g. 'rainfall "
                 "typically lowers salinity and can affect dissolved oxygen') as long as "
                 "you're clear that's general reasoning, not a number this dataset produced.\n\n"
+                "BAY SENSOR SCIENTIFIC SAFEGUARDS: Never treat GNN-imputed values as observed "
+                "low oxygen. For 2/4 mg/L episodes use run_data_model operation='hypoxia_audit' "
+                "with an observed flag when the file has one. Unknown/low-coverage days are "
+                "not healthy days; missing data censor onsets and recoveries. Keep stations "
+                "and independent instrument sources distinct. All episodes here are "
+                "retrospective descriptions, not early-warning forecasts. FCM weights are "
+                "lagged associations, not causal effects, and its trajectories are not "
+                "validated predictions. Do not promise that an FCM exists for mixed or "
+                "irregularly sampled datasets.\n\n"
                 + build_context(dfs, fcm_summaries)
             ),
         },
@@ -1218,6 +1240,34 @@ async def chat(req: ChatRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class HypoxiaAuditRequest(BaseModel):
+    dataset_id: str
+    timestamp_col: str | None = None
+    do_col: str | None = None
+    station_col: str | None = None
+    observed_col: str | None = None
+    interval_minutes: int = 5
+    min_coverage: float = 0.95
+    timezone: str = "America/New_York"
+    station: str | None = None
+
+
+@app.post("/api/hypoxia-audit")
+async def hypoxia_audit_endpoint(req: HypoxiaAuditRequest):
+    df = datasets.get(req.dataset_id)
+    if df is None:
+        raise HTTPException(404, "Unknown dataset_id; load data first")
+    try:
+        return hypoxia_audit(
+            df, timestamp_col=req.timestamp_col, do_col=req.do_col,
+            station_col=req.station_col, observed_col=req.observed_col,
+            interval_minutes=req.interval_minutes, min_coverage=req.min_coverage,
+            timezone=req.timezone, station=req.station,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 class ChartRequest(BaseModel):
