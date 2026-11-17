@@ -4,6 +4,7 @@ This runs the Streamlit script (not a graphical browser session) and mocks
 network responses; actual Ollama/browser checks remain separate manual steps.
 """
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
@@ -40,7 +41,7 @@ def fake_get(url, **kwargs):
 class StreamlitResearchScreenTests(unittest.TestCase):
     def test_research_browser_without_uploaded_dataset(self):
         with patch("requests.get", side_effect=fake_get):
-            app = AppTest.from_file("streamlit_app.py").run(timeout=30)
+            app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "streamlit_app.py")).run(timeout=30)
         self.assertEqual(len(app.exception), 0, [str(x.message) for x in app.exception])
         labels = [item.label for item in app.selectbox]
         self.assertIn("Research result", labels)
