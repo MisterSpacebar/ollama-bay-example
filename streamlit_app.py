@@ -6,6 +6,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from frontend.research_panel import render_research_panel
+
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="Ollama Data Chat", layout="wide")
@@ -104,7 +106,9 @@ with st.sidebar:
             st.error(res.json().get("detail", res.text))
 
 if not st.session_state.dataset_id and not st.session_state.dataset_group_id:
-    st.info("Load a dataset from the sidebar to get started.")
+    st.info("Load a sensor dataset for charts or observed oxygen analysis. "
+            "You can browse the configured research results without loading one.")
+    render_research_panel(API_BASE)
     st.stop()
 
 st.caption(f"Loaded: **{st.session_state.dataset_label}**")
@@ -310,68 +314,7 @@ with tab_model:
                 st.error(res.json().get("detail", res.text))
 
 with tab_research:
-    st.caption("Read-only upstream research artifacts. Historical observations and retrospective "
-               "hindcasts only; this does not train models or provide live alerts.")
-    try:
-        catalog_response = requests.get(f"{API_BASE}/api/research/catalog", timeout=8)
-        catalog_response.raise_for_status()
-        research_catalog = catalog_response.json()
-    except Exception as exc:
-        research_catalog = {"enabled": False, "available": [], "missing": []}
-        st.warning(f"Research catalog unavailable: {exc}")
-    if not research_catalog["enabled"]:
-        st.info("Set BAY_RESEARCH_OUTPUT_DIR to the locally generated trustworthy_outputs folder "
-                "and restart the FastAPI backend.")
-    else:
-        available = research_catalog["available"]
-        if available:
-            research_choice = st.selectbox("Upstream result", [item["artifact"] for item in available])
-            selected = next(item for item in available if item["artifact"] == research_choice)
-            st.caption(selected["description"])
-            rc1, rc2, rc3 = st.columns(3)
-            with rc1:
-                research_station = st.text_input("Exact station (optional)", key="research_station")
-                research_threshold = st.selectbox("DO threshold", ["All", "2", "4"], key="research_threshold")
-            with rc2:
-                research_horizon = st.selectbox("Horizon", ["All", "1", "3", "7"], key="research_horizon")
-                research_model = st.text_input("Model name (optional)", key="research_model")
-            with rc3:
-                research_date = st.text_input("Historical issue date YYYY-MM-DD (optional)", key="research_date")
-                research_limit = st.slider("Display rows", 5, 60, 20, 5)
-            if st.button("Query research output"):
-                payload = {"artifact": research_choice, "limit": research_limit}
-                if research_station.strip():
-                    payload["station"] = research_station.strip()
-                if research_threshold != "All":
-                    payload["threshold_mg_l"] = float(research_threshold)
-                if research_horizon != "All":
-                    payload["horizon_days"] = int(research_horizon)
-                if research_model.strip():
-                    payload["model"] = research_model.strip()
-                if research_date.strip():
-                    payload["issue_date"] = research_date.strip()
-                try:
-                    res = requests.post(f"{API_BASE}/api/research/query", json=payload, timeout=30)
-                    if res.ok:
-                        st.session_state.research_result = res.json()
-                    else:
-                        st.error(res.json().get("detail", res.text))
-                except Exception as exc:
-                    st.error(f"Query failed: {exc}")
-            result = st.session_state.get("research_result")
-            if result and result.get("artifact") == research_choice:
-                st.write(f"Matching historical rows: {result['n_matching']}")
-                st.dataframe(pd.DataFrame(result["rows"]), use_container_width=True)
-                if result["truncated"]:
-                    st.caption("Preview truncated; refine filters to inspect narrower subsets.")
-                st.caption(result["interpretation"])
-                st.caption(f"Input file SHA-256: {result['file_sha256']}")
-        else:
-            st.info("No supported research result files found.")
-        if research_catalog["missing"]:
-            with st.expander("Missing upstream exports", expanded=False):
-                st.dataframe(pd.DataFrame(research_catalog["missing"]), use_container_width=True)
-
+    render_research_panel(API_BASE)
 
 with tab_oxygen:
     st.caption(
