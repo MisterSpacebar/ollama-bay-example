@@ -7,3 +7,5 @@ ollama
 streamlit
 requests
 matplotlib
+
+httpx>=0.27

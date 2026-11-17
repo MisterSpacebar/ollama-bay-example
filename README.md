@@ -75,3 +75,73 @@ upstream scientific repository. Run synthetic regression tests using:
 python -m unittest discover -s tests -v
 python -m py_compile backend/*.py streamlit_app.py
 ```
+
+
+## Read-only upstream GAM, episode and Markov research outputs
+
+The **Research outputs** Streamlit tab, `GET /api/research/catalog`,
+`POST /api/research/query`, and Ollama `query_research_output` tool read
+research tables produced by the upstream
+[multinode-bay-imputation](https://github.com/MisterSpacebar/multinode-bay-imputation)
+pipeline, without refitting models or confusing GNN reconstruction with
+observed DO.
+
+Set the environment variable **on the FastAPI server** to the actual
+`trustworthy_outputs` directory created locally by that project:
+
+```powershell
+$env:BAY_RESEARCH_OUTPUT_DIR = "C:\\path\\to\\multinode-bay-imputation\\trustworthy_outputs"
+uvicorn backend.main:app --reload
+```
+
+Do **not** point this variable at raw private sensor data or at the repository
+root. The adapter is disabled when the directory is absent or unconfigured.
+Its catalog lists missing generated artifacts rather than fabricating results.
+If no datasets have been loaded, clients can use
+`POST /api/chat` with `{"research_only": true, "question": "..."}`.
+When a dataset is loaded, the chat agent can also query the research tool.
+
+Supported exports include `environmental_gam/paired_scores.csv` and
+`gam_smooth_effects.csv`, episode summary/run records, station-level
+transition matrices, Markov uncertainty summaries,
+`transition_warning/hindcast_scores.csv`,
+`hindcast_predictions.csv`, and optional historical dashboard snapshots.
+
+Example historical query:
+
+```json
+{
+  "artifact": "warning_hindcasts",
+  "station": "EXACT_STATION_ID",
+  "horizon_days": 3,
+  "issue_date": "2025-07-15",
+  "model": "do_history"
+}
+```
+
+The response returns the exact output file's SHA-256, selected records,
+the number of matched rows and provenance/limitations. It never exposes
+arbitrary paths to model tool calls. A valid file is **not** independently
+verified against its original upstream input hashes; if files from different
+analysis runs were combined, results may not be comparable.
+
+**Scientific limitations:** The GAM severity smooth is a conditional
+**same-day association**, not a forecast or intervention effect. The GAM
+recovery model concerns observed active episodes, not a new-onset warning.
+The Markov model is a stationary benchmark; its Monte Carlo paths are
+hypothetical. Warning hindcasts predict first Severe onset in 1/3/7 days
+from eligible non-Severe end-of-day origins; the reported outcome was
+observed later and is included *only* for retrospective evaluation.
+Neither historical snapshots nor hindcasts imply current-day live alerts.
+Missing files, stations, and dates are not evidence of zero risk.
+
+To validate the adapter and HTTP endpoints, in addition to earlier unit tests:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile backend/*.py streamlit_app.py
+```
+
+The suite uses synthetic CSVs and mocks Ollama; it does not claim to validate
+scientific performance against your private source data, nor to exercise a
+real browser/Streamlit session.
