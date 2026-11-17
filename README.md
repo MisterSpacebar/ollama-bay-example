@@ -172,3 +172,70 @@ replace the Linux CI real-symlink test.
 Some newer Starlette/HTTP-client combinations may show deprecation notices.
 Treat those as dependency-compatibility warnings to investigate before any
 library migration, not as a reason to bypass the integration tests.
+
+
+## Real `trustworthy_outputs` integration validation
+
+The research browser now works **without uploading a separate sensor dataset**.
+Start FastAPI with `BAY_RESEARCH_OUTPUT_DIR` set to the locally generated
+`trustworthy_outputs` directory, then run Streamlit. The **Research outputs**
+screen can browse results and ask Ollama questions using research-only mode.
+
+From the `ollama-bay-example` repository on Windows PowerShell, point the
+API to the **actual generated output directory** of the other repository:
+
+```powershell
+python -m pip install -r requirements-test.txt
+$env:BAY_RESEARCH_OUTPUT_DIR = "C:\\path\\to\\multinode-bay-imputation\\trustworthy_outputs"
+uvicorn backend.main:app --reload
+```
+
+From another PowerShell terminal, run the independent source-versus-adapter
+validator. The `--api-url` option compares live HTTP responses with the
+original output CSV rows, counts and SHA-256 hashes. It does **not** contact
+Ollama or regenerate models:
+
+```powershell
+python -m scripts.validate_research_outputs --root "C:\\path\\to\\multinode-bay-imputation\\trustworthy_outputs" --api-url http://127.0.0.1:8000 --report validation_report.local.json
+```
+
+To use only local files when the API is offline, omit `--api-url`.
+The validator reports available/missing supported outputs, checks upstream
+observed-only provenance, tests station/model pairing and monotonic warning
+horizons, verifies metadata-linked input hashes **where source files exist**,
+and compares the actual CSV records to both the backend adapter and optional
+running FastAPI endpoints. The command returns a nonzero exit code for missing
+all supported outputs, invalid input, mismatched metadata/hashes, and API
+disagreement. A pass with unavailable input hashes is labeled
+`pass_with_unverified_lineage`, not a fully established scientific lineage.
+Never commit a source-specific local validation report or private exports.
+
+The upstream results are generated separately in `multinode-bay-imputation`:
+
+```powershell
+# Run these from the *multinode-bay-imputation* repository root.
+python -m trustworthy.quality
+python -m trustworthy.regimes
+python -m trustworthy.episode_dynamics
+python -m trustworthy.episode_transitions --regimes trustworthy_outputs/onset/regime_days.csv --out-dir trustworthy_outputs/episode_dynamics
+python -m trustworthy.episode_survival
+python -m trustworthy.environmental_gam
+python -m trustworthy.transition_warning
+python -m trustworthy.warning_dashboard
+```
+
+These commands assume upstream requirements and observed-only inputs are
+available; consult the upstream phase documents for exact options and ordering.
+Do not replace missing observed-only source inputs with GNN reconstructions.
+
+Finally, to browse the results:
+
+```powershell
+streamlit run streamlit_app.py
+```
+
+Open the **Research outputs** screen, query a historical station/date/model,
+and use the separate research-only chat input. This is a usability check;
+neither a successful validator nor an Ollama answer is a substitute for
+independent scientific calibration. If a browser or Ollama server is not
+available, note that those stages remain untested.
