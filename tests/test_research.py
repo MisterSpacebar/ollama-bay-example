@@ -1,6 +1,7 @@
 """Read-only adapter tests with synthetic upstream-format research CSV files."""
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import pandas as pd
@@ -120,6 +121,25 @@ class ResearchAdapterTests(unittest.TestCase):
                 'outcome': 'o', 'threshold_mgL': 2,
                 'model': 'baseline', 'n_paired': 2, 'skill_vs_baseline': 0,
             }])
+            with self.assertRaisesRegex(ValueError, 'escapes'):
+                query_research('gam_scores', root=self.root)
+
+
+    def test_path_escape_guard_without_symlink_privileges(self):
+        """Always exercise resolved-path containment, even on Windows without symlinks."""
+        # Model a symlink's resolved destination without creating a real link.
+        # This tests the actual path-containment guard; the separate real-link
+        # test verifies filesystem behavior wherever symlinks are permitted.
+        candidate = self.root / 'environmental_gam' / 'paired_scores.csv'
+        outside = self.root.parent / 'escaped' / 'paired_scores.csv'
+        original_resolve = Path.resolve
+
+        def simulate_escape(path, *args, **kwargs):
+            if path == candidate:
+                return outside
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, 'resolve', autospec=True, side_effect=simulate_escape):
             with self.assertRaisesRegex(ValueError, 'escapes'):
                 query_research('gam_scores', root=self.root)
 
