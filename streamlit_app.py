@@ -31,6 +31,7 @@ def set_dataset(data: dict):
     st.session_state.dataset_group_id = None
     st.session_state.group_datasets = []
     st.session_state.history = []
+    st.session_state.oxygen_analysis = None
 
 
 def set_dataset_group(data: dict):
@@ -42,6 +43,7 @@ def set_dataset_group(data: dict):
     st.session_state.preview = []
     st.session_state.cleaning_report = []
     st.session_state.history = []
+    st.session_state.oxygen_analysis = None
 
 
 with st.sidebar:
@@ -131,11 +133,11 @@ else:
     fcm_summary = picked_entry.get("fcm_summary")
 
 if fcm_summary and fcm_summary.get("top_causal_edges"):
-    with st.expander("Precomputed causal relationships (FCM)", expanded=False):
-        st.caption("Fit once at load time; the chat agent uses this directly instead of refitting it per question.")
+    with st.expander("Exploratory lagged associations (FCM)", expanded=False):
+        st.caption("Noncausal and retrospective; available only for regularly sampled, single-station time series.")
         st.dataframe(fcm_summary["top_causal_edges"], use_container_width=True)
 
-tab_chat, tab_chart, tab_model = st.tabs(["Chat", "Chart", "Train & predict"])
+tab_chat, tab_chart, tab_model, tab_oxygen = st.tabs(["Chat", "Chart", "Train & predict", "Observed oxygen"])
 
 
 def render_tool_lines(tool_lines: list[str]):
@@ -306,6 +308,61 @@ with tab_model:
                 st.success(f"Predicted {target_col}: {res.json()['predictions'][0]}")
             else:
                 st.error(res.json().get("detail", res.text))
+
+with tab_oxygen:
+    st.caption(
+        "Retrospective, coverage-qualified dissolved oxygen episodes at <2 and <4 mg/L. "
+        "No imputation, live warnings, or causal claims. Unknown days are never assumed normal."
+    )
+    preferred_time = ["datetime", "timestamp", "date_time", "time", "date", "Date"]
+    preferred_do = ["odo_mgL", "exo.odo_mgL", "DO (mg/L)", "Dissolved Oxygen (mg/L)", "do_mgL"]
+    def default_index(options, preferred):
+        return next((options.index(c) for c in preferred if c in options), 0)
+
+    if all_cols:
+        time_choice = st.selectbox("Timestamp column", all_cols, index=default_index(all_cols, preferred_time))
+        do_choice = st.selectbox("Dissolved oxygen (mg/L) column", all_cols, index=default_index(all_cols, preferred_do))
+        station_options = ["(auto)"] + all_cols
+        station_choice = st.selectbox("Station/source column", station_options)
+        flag_choice = st.selectbox("Observed flag column", ["(auto)"] + all_cols)
+        interval_choice = st.selectbox("Sampling interval (minutes)", [5, 10, 15, 30, 60])
+        coverage_choice = st.slider("Minimum valid daily coverage", 0.5, 1.0, 0.95, 0.01)
+        tz_choice = st.text_input("Local timezone", "America/New_York")
+        station_filter = st.text_input("Specific station ID (optional)", "")
+        if st.button("Analyze observed oxygen"):
+            payload = {
+                "dataset_id": chart_dataset_id,
+                "timestamp_col": time_choice,
+                "do_col": do_choice,
+                "station_col": None if station_choice == "(auto)" else station_choice,
+                "observed_col": None if flag_choice == "(auto)" else flag_choice,
+                "interval_minutes": interval_choice,
+                "min_coverage": coverage_choice,
+                "timezone": tz_choice,
+                "station": station_filter.strip() or None,
+            }
+            try:
+                res = requests.post(f"{API_BASE}/api/hypoxia-audit", json=payload, timeout=60)
+                if res.ok:
+                    st.session_state.oxygen_analysis = {"dataset_id": chart_dataset_id, "result": res.json()}
+                else:
+                    st.error(res.json().get("detail", res.text))
+            except Exception as exc:
+                st.error(f"Audit request failed: {exc}")
+        cached = st.session_state.get("oxygen_analysis")
+        if cached and cached.get("dataset_id") == chart_dataset_id:
+            report = cached["result"]
+            st.info(f"{report['status']} | {report['provenance']} | stations: {report['stations_analyzed']}")
+            st.subheader("Station / threshold summaries")
+            st.dataframe(pd.DataFrame(report["station_summaries"]), use_container_width=True)
+            if report.get("summaries_truncated"):
+                st.caption("Summary preview truncated; select a single station for narrower results.")
+            st.subheader("Recent observed episodes")
+            st.dataframe(pd.DataFrame(report["episodes"]), use_container_width=True)
+            st.subheader("Latest daily coverage / readings")
+            st.dataframe(pd.DataFrame(report["latest_daily_records"]), use_container_width=True)
+            st.caption(report["interpretation"])
+
 
 with tab_chat:
     for msg in st.session_state.history:
