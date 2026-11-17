@@ -21,6 +21,7 @@ from backend.modeling import run_data_model
 from backend.charts import make_chart, prepare_native_chart_data
 from backend.fcm_safe import safe_fcm as fit_fcm
 from backend.trustworthy_bay import hypoxia_audit
+from backend.research import query_research, research_catalog
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "granite4.1:8b")
@@ -954,15 +955,68 @@ async def load_all_local_datasets(req: LoadAllRequest):
     return {"dataset_group_id": group_id, "datasets": summaries}
 
 
+RESEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "query_research_output",
+        "description": (
+            "Read independently computed research results from the configured upstream "
+            "trustworthy_outputs directory; NEVER treat these as live readings. "
+            "Available artifacts: gam_scores (paired validation), gam_effects "
+            "(conditional noncausal smooths), episode_summary, episode_runs, "
+            "transitions, markov_summary, warning_scores, warning_hindcasts "
+            "(monthly out-of-sample 1/3/7-day severe-onset risks), warning_snapshot "
+            "(latest historical records, NOT current conditions). Use the actual "
+            "file evidence and cite artifact/filters; missing rows are not zeros. "
+            "Do not confuse a hindcast future label with an issue-day predictor."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "artifact": {"type": "string", "enum": [
+                    "gam_scores", "gam_effects", "episode_summary", "episode_runs",
+                    "transitions", "markov_summary", "warning_scores",
+                    "warning_hindcasts", "warning_snapshot"]},
+                "station": {"type": "string"},
+                "threshold_mg_l": {"type": "number"},
+                "horizon_days": {"type": "integer"},
+                "model": {"type": "string"},
+                "issue_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 60},
+            },
+            "required": ["artifact"],
+        },
+    },
+}
+
+
+def execute_research_tool(kwargs: dict) -> tuple[str, dict | None]:
+    try:
+        result = query_research(**kwargs)
+        display = {"rows": result["rows"], "total_rows": result["n_matching"],
+                   "truncated": result["truncated"]} if result["rows"] else None
+        compact = {key: value for key, value in result.items() if key != "rows"}
+        compact["rows"] = result["rows"][:12]
+        return json.dumps(compact, default=str)[:14000], display
+    except (ValueError, TypeError, OSError) as exc:
+        return f"Error querying research output: {exc}", None
+
+
 class ChatRequest(BaseModel):
     dataset_id: str | None = None
     dataset_group_id: str | None = None
     question: str
+    research_only: bool = False
 
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    if req.dataset_group_id:
+    if req.research_only:
+        if not research_catalog()["enabled"]:
+            raise HTTPException(400, "Research outputs not configured")
+        dfs = {}
+        fcm_summaries = {}
+    elif req.dataset_group_id:
         dfs = dataset_groups.get(req.dataset_group_id)
         if dfs is None:
             raise HTTPException(404, "Unknown dataset_group_id; load all datasets first")
@@ -1119,6 +1173,16 @@ async def chat(req: ChatRequest):
                 "lagged associations, not causal effects, and its trajectories are not "
                 "validated predictions. Do not promise that an FCM exists for mixed or "
                 "irregularly sampled datasets.\n\n"
+                "RESEARCH ARTIFACTS: A separate read-only scientific output catalog may "
+                "be configured. For questions on held-out GAM scores, observed episode "
+                "transitions, recovery, Markov, 1/3/7-day hindcasts, use "
+                "query_research_output; never invent results or describe retrospective "
+                "research as a live forecast. GAM curves are conditional associations; "
+                "never infer causal effects. Hindcast labels are historical future "
+                "outcomes and must never be treated as issue-date inputs. "
+                "Use one station/date/horizon/model filter when relevant; report "
+                "missing files, sparse samples and unmatched dates explicitly.\\n"
+                + f"Research output catalog: {json.dumps(research_catalog())[:5500]}\\n\\n"
                 + build_context(dfs, fcm_summaries)
             ),
         },
@@ -1132,7 +1196,7 @@ async def chat(req: ChatRequest):
         response = await client.chat(
             model=MODEL,
             messages=messages,
-            tools=[PANDAS_TOOL, MODEL_TOOL, CHART_TOOL, MAP_TOOL],
+            tools=([RESEARCH_TOOL] if req.research_only else [PANDAS_TOOL, MODEL_TOOL, CHART_TOOL, MAP_TOOL] + ([RESEARCH_TOOL] if research_catalog()["enabled"] else [])),
             options=OLLAMA_CHAT_OPTIONS,
         )
         tool_calls = response.message.tool_calls
@@ -1141,7 +1205,9 @@ async def chat(req: ChatRequest):
         messages.append({"role": "assistant", "content": response.message.content or "", "tool_calls": tool_calls})
         for call in tool_calls:
             name = call.function.name
-            if name == "run_data_model":
+            if name == "query_research_output":
+                output, display = execute_research_tool(dict(call.function.arguments))
+            elif name == "run_data_model":
                 output, display = await run_model_tool(dfs, dict(call.function.arguments))
             elif name == "make_chart":
                 output, display = await run_chart_tool(dfs, dict(call.function.arguments))
@@ -1240,6 +1306,29 @@ async def chat(req: ChatRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.get("/api/research/catalog")
+async def research_catalog_endpoint():
+    return research_catalog()
+
+
+class ResearchQueryRequest(BaseModel):
+    artifact: str
+    station: str | None = None
+    threshold_mg_l: float | None = None
+    horizon_days: int | None = None
+    model: str | None = None
+    issue_date: str | None = None
+    limit: int = 20
+
+
+@app.post("/api/research/query")
+async def research_query_endpoint(req: ResearchQueryRequest):
+    try:
+        return query_research(**req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 class HypoxiaAuditRequest(BaseModel):
